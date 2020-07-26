@@ -18,6 +18,7 @@ use std::fmt;
 use std::result::Result::Err;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -173,17 +174,23 @@ impl ListeningParameters {
 
 pub struct AS3935 {
     interface: Arc<Mutex<Box<dyn Interface>>>,
-    irq_pin: IrqPin,
+    irq_pin: Arc<Mutex<IrqPin>>,
     state: State,
+    lock: Arc<Mutex<i32>>,
 }
 
 impl AS3935 {
-    pub fn new(interface_selection: InterfaceSelection, irq_pin: IrqPin) -> Result<Self> {
+    pub fn new(
+        interface_selection: InterfaceSelection,
+        irq_pin: IrqPin,
+        lock: Arc<Mutex<i32>>,
+    ) -> Result<Self> {
         Ok(match interface_selection {
             InterfaceSelection::I2c(i2c, i2c_address) => Self {
                 interface: Arc::new(Mutex::new(Box::new(I2cInterface::new(i2c, i2c_address)?))),
-                irq_pin,
+                irq_pin: Arc::new(Mutex::new(irq_pin)),
                 state: State::StandingBy,
+                lock: lock,
             },
             InterfaceSelection::Spi(_, _) => unimplemented!(),
         })
@@ -207,7 +214,8 @@ impl AS3935 {
         self.configure_listen_parameters(parameters)?;
 
         let (sender, receiver) = channel::<Event>();
-        self.setup_irq(sender)?;
+        //self.setup_irq(sender)?;
+        self.setup_polling(sender)?;
 
         self.state = State::Listening;
 
@@ -217,7 +225,7 @@ impl AS3935 {
     pub fn terminate(&mut self) -> Result<()> {
         self.assert_state(&self.state, &[State::Listening])?;
 
-        self.irq_pin.clear_async_interrupt().unwrap();
+        self.irq_pin.lock().unwrap().clear_async_interrupt().unwrap();
         self.power_down()?;
 
         self.state = State::PoweredDown;
@@ -373,35 +381,89 @@ impl AS3935 {
         Ok(())
     }
 
-    fn setup_irq(&mut self, sender: Sender<Event>) -> Result<()> {
+    fn setup_polling(&mut self, sender: Sender<Event>) -> Result<()> {
         let interface_mutex = self.interface.clone();
+        let bus_mutex = self.lock.clone();
+        let pin = self.irq_pin.clone();
+        std::thread::spawn(move || {
+            loop {
+                //Poll every 500ms looking for low state
+                thread::sleep(Duration::from_millis(500));
 
-        self.irq_pin
-            .set_async_interrupt(Trigger::RisingEdge, move |_level: Level| {
-                sleep(IRQ_TRIGGER_TO_READY_DELAY);
+                let level = pin.lock().unwrap().read();
+                if level == Level::High {
+                    debug!("Enter: IRQ Handler");
+                    sleep(IRQ_TRIGGER_TO_READY_DELAY);
 
-                let mut interface = interface_mutex.lock().unwrap();
+                    debug!("Getting interface lock");
+                    let mut interface = interface_mutex.lock().unwrap();
+                    debug!("Got interface lock, getting mutex lock");
+                    let _ = bus_mutex.lock().unwrap();
+                    debug!("Got mutex lock, reading event");
 
-                let irq = Irq::from(interface.read(Box::new(Interrupt)).unwrap());
+                    let irq = Irq::from(interface.read(Box::new(Interrupt)).unwrap());
 
-                let event = match irq {
-                    Irq::DistanceEstimationChanged => return,
-                    Irq::DisturberDetected => Event::Disturbance,
-                    Irq::Lightning => {
-                        sleep(LIGHTNING_CALCULATION_DELAY);
-                        Event::Lightning(HeadOfStormDistance::from(
-                            interface.read(Box::new(DistanceEstimation)).unwrap(),
-                        ))
-                    }
-                    Irq::NoiseLevelTooHigh => Event::Noise,
-                };
-
-                sender.send(event).unwrap();
-            })
-            .unwrap();
+                    let event = match irq {
+                        Irq::DistanceEstimationChanged => {
+                            debug!("Exit: IRQ Handler, DistanceEstimationChanged");
+                            continue;
+                        }
+                        Irq::DisturberDetected => Event::Disturbance,
+                        Irq::Lightning => {
+                            sleep(LIGHTNING_CALCULATION_DELAY);
+                            Event::Lightning(HeadOfStormDistance::from(
+                                interface.read(Box::new(DistanceEstimation)).unwrap(),
+                            ))
+                        }
+                        Irq::NoiseLevelTooHigh => Event::Noise,
+                    };
+                    debug!("Read event, sending event");
+                    sender.send(event).unwrap();
+                    debug!("Exit: IRQ Handler")
+                }
+            }
+        });
 
         Ok(())
     }
+
+    // fn setup_irq(&mut self, sender: Sender<Event>) -> Result<()> {
+    //     let interface_mutex = self.interface.clone();
+    //     let bus_mutex = self.lock.clone();
+
+    //     self.irq_pin
+    //         .set_async_interrupt(Trigger::RisingEdge, move |_level: Level| {
+    //             debug!("Enter: IRQ Handler");
+    //             sleep(IRQ_TRIGGER_TO_READY_DELAY);
+
+    //             let mut interface = interface_mutex.lock().unwrap();
+
+    //             let _ = bus_mutex.lock().unwrap();
+
+    //             let irq = Irq::from(interface.read(Box::new(Interrupt)).unwrap());
+
+    //             let event = match irq {
+    //                 Irq::DistanceEstimationChanged => {
+    //                     debug!("Exit: IRQ Handler, DistanceEstimationChanged");
+    //                     return;
+    //                 }
+    //                 Irq::DisturberDetected => Event::Disturbance,
+    //                 Irq::Lightning => {
+    //                     sleep(LIGHTNING_CALCULATION_DELAY);
+    //                     Event::Lightning(HeadOfStormDistance::from(
+    //                         interface.read(Box::new(DistanceEstimation)).unwrap(),
+    //                     ))
+    //                 }
+    //                 Irq::NoiseLevelTooHigh => Event::Noise,
+    //             };
+
+    //             sender.send(event).unwrap();
+    //             debug!("Exit: IRQ Handler")
+    //         })
+    //         .unwrap();
+
+    //     Ok(())
+    // }
 
     fn assert_state(&self, state: &State, valid_states: &[State]) -> Result<()> {
         if !valid_states.contains(state) {
